@@ -1,7 +1,5 @@
 import { randomUUID } from 'crypto';
 import http from 'http';
-import https from 'https';
-import tls from 'tls';
 import { pathToFileURL } from 'url';
 
 const DOC_ID = '26328147246854413';
@@ -126,105 +124,12 @@ const PORT = parseInt(process.env.PORT || '8080');
 // ============================================================
 
 // ============================================================
-// NEW METHOD — minimal graphql call through a proxy pool.
-// No session, no cookies, no LSD token. Round-robin with
-// failover across all proxies.
+// NEW METHOD — minimal graphql call, DIRECT (no proxy).
+// No session, no cookies, no LSD token. The proxy pool was
+// removed: every line pointed at the same change6.owlproxy.com
+// host so it never actually failed over, and the webshare
+// fallback returned 407 on nearly every attempt.
 // ============================================================
-
-const DEFAULT_PROXIES = `
-change6.owlproxy.com:7778:xwngkCybPO20_custom_zone_DE:4995486
-change6.owlproxy.com:7778:s2xCkyV0ua10_custom_zone_GB:4995496
-change6.owlproxy.com:7778:BqrgEG4HDJ30_custom_zone_FR:4995519
-change6.owlproxy.com:7778:Qn4d5uzwDG60_custom_zone_IT:4995604
-change6.owlproxy.com:7778:fuhtbT5SAy20_custom_zone_ES:4995614
-change6.owlproxy.com:7778:lNzJvGYj4Q10_custom_zone_PL:4995622
-change6.owlproxy.com:7778:Kky6pMkIR060_custom_zone_RO:4995630
-change6.owlproxy.com:7778:U98ukt2SeM90_custom_zone_NL:4998927
-change6.owlproxy.com:7778:j1RNH3Cowd30_custom_zone_BE:4999069
-change6.owlproxy.com:7778:W2VVi5gLKE70_custom_zone_CZ:4999794
-change6.owlproxy.com:7778:SFFXNIABkJ70_custom_zone_SE:5000107
-`.trim();
-
-function parseProxy(line) {
-  const [host, port, user, pass] = line.split(':');
-  return { host, port: parseInt(port, 10), user, pass };
-}
-
-const PROXIES = (process.env.FB_PROXIES || DEFAULT_PROXIES)
-  .split('\n')
-  .map(s => s.trim())
-  .filter(Boolean)
-  .map(parseProxy);
-
-// Fallback pool (WebShare) — used only when every primary proxy fails.
-const DEFAULT_FALLBACK_PROXIES = `
-31.59.20.176:6754:ratulUsername:ratulproxy
-31.56.127.193:7684:ratulUsername:ratulproxy
-45.38.107.97:6014:ratulUsername:ratulproxy
-198.105.121.200:6462:ratulUsername:ratulproxy
-64.137.96.74:6641:ratulUsername:ratulproxy
-198.23.243.226:6361:ratulUsername:ratulproxy
-38.154.185.97:6370:ratulUsername:ratulproxy
-84.247.60.125:6095:ratulUsername:ratulproxy
-142.111.67.146:5611:ratulUsername:ratulproxy
-191.96.254.138:6185:ratulUsername:ratulproxy
-`.trim();
-
-const FALLBACK_PROXIES = (process.env.FB_FALLBACK_PROXIES || DEFAULT_FALLBACK_PROXIES)
-  .split('\n')
-  .map(s => s.trim())
-  .filter(Boolean)
-  .map(parseProxy);
-
-let rrCounter = 0;
-
-function proxyTunnel(proxy, targetHost, targetPort) {
-  return new Promise((resolve, reject) => {
-    const auth = Buffer.from(`${proxy.user}:${proxy.pass}`).toString('base64');
-    const req = http.request({
-      host: proxy.host,
-      port: proxy.port,
-      method: 'CONNECT',
-      path: `${targetHost}:${targetPort}`,
-      headers: { Host: `${targetHost}:${targetPort}`, 'Proxy-Authorization': `Basic ${auth}` },
-    });
-    req.setTimeout(20000, () => req.destroy(new Error('CONNECT timeout')));
-    req.on('connect', (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        return reject(new Error(`CONNECT failed: HTTP ${res.statusCode}`));
-      }
-      const tlsSocket = tls.connect({ socket, servername: targetHost }, () => resolve(tlsSocket));
-      tlsSocket.on('error', reject);
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-function proxiedPost(proxy, targetHost, targetPath, headers, body, timeoutMs = 25000) {
-  return new Promise(async (resolve, reject) => {
-    let socket;
-    try { socket = await proxyTunnel(proxy, targetHost, 443); } catch (e) { return reject(e); }
-    const bodyBuf = Buffer.from(body);
-    const req = https.request({
-      createConnection: () => socket,
-      hostname: targetHost,
-      port: 443,
-      path: targetPath,
-      method: 'POST',
-      headers: { ...headers, 'Content-Length': bodyBuf.length },
-    }, res => {
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
-    });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('Request timeout')));
-    req.on('error', reject);
-    req.write(bodyBuf);
-    req.end();
-  });
-}
 
 const GRAPHQL_HEADERS = {
   'Content-Type': 'application/x-www-form-urlencoded',
@@ -262,39 +167,47 @@ function acquireSession() {
   return { lsd: '', cookies: {}, acquiredAt: Date.now() };
 }
 
-async function checkNumber(phone) {
-  if (!PROXIES.length && !FALLBACK_PROXIES.length) return { phone, ok: false, found: false, error: 'No proxies configured' };
+const RETRIES = parseInt(process.env.FB_RETRIES || '3', 10);
+const TIMEOUT_MS = parseInt(process.env.FB_TIMEOUT_MS || '20000', 10);
 
-  const pools = [
-    { list: PROXIES, tag: 'owlproxy' },
-    { list: FALLBACK_PROXIES, tag: 'webshare' },
-  ];
+async function directPost(targetHost, targetPath, headers, body, timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${BASE}${targetPath}`, {
+      method: 'POST',
+      headers,
+      body,
+      signal: ctl.signal,
+    });
+    return { status: res.status, body: Buffer.from(await res.arrayBuffer()) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkNumber(phone) {
   let lastError = null;
 
-  for (const pool of pools) {
-    if (!pool.list.length) continue;
-    const start = (rrCounter++) % pool.list.length;
-    for (let i = 0; i < pool.list.length; i++) {
-      const proxy = pool.list[(start + i) % pool.list.length];
-      try {
-        const res = await proxiedPost(proxy, 'www.facebook.com', '/api/graphql/', GRAPHQL_HEADERS, buildBody(phone));
-        let text = res.body.toString();
-        if (text.startsWith('for (;;);')) text = text.slice(9);
-        const parsed = JSON.parse(text);
-        const search = parsed?.data?.caa_ar_fb_account_search;
-        if (!search) return { phone, ok: false, found: false, error: 'Empty response' };
-        const found = search.accounts.length > 0;
-        const desc = search.error_content?.description || null;
-        console.log(`[check] ${phone} -> ${found ? 'USED (account found)' : 'FRESH'} | ${desc || ''}`);
-        return { phone, ok: true, found, error: desc };
-      } catch (e) {
-        lastError = e.message;
-        console.log(`[check] ${phone} -> ${pool.tag} ${proxy.host}:${proxy.port} failed: ${e.message}`);
-      }
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    try {
+      const res = await directPost('www.facebook.com', '/api/graphql/', GRAPHQL_HEADERS, buildBody(phone), TIMEOUT_MS);
+      let text = res.body.toString();
+      if (text.startsWith('for (;;);')) text = text.slice(9);
+      const parsed = JSON.parse(text);
+      const search = parsed?.data?.caa_ar_fb_account_search;
+      if (!search) throw new Error(`Empty response (HTTP ${res.status})`);
+      const found = search.accounts.length > 0;
+      const desc = search.error_content?.description || null;
+      console.log(`[check] ${phone} -> ${found ? 'USED (account found)' : 'FRESH'} | ${desc || ''} | direct, ${TIMEOUT_MS}ms budget, attempt ${attempt}/${RETRIES}`);
+      return { phone, ok: true, found, error: desc };
+    } catch (e) {
+      lastError = e.name === 'AbortError' ? 'Request timeout' : e.message;
+      console.log(`[check] ${phone} -> direct failed: ${lastError} (attempt ${attempt}/${RETRIES})`);
     }
   }
 
-  return { phone, ok: false, found: false, error: lastError || 'All proxies failed' };
+  return { phone, ok: false, found: false, error: lastError || 'Request failed' };
 }
 
 // ============================================================
@@ -316,7 +229,7 @@ const server = http.createServer(async (req, res) => {
   const path = url.pathname;
 
   if (req.method === 'GET' && path === '/health') {
-    return jsonResponse(res, 200, { status: 'ok', uptime: process.uptime(), owlproxy: PROXIES.length, webshare: FALLBACK_PROXIES.length });
+    return jsonResponse(res, 200, { status: 'ok', uptime: process.uptime(), mode: 'direct', proxies: 0 });
   }
 
   if ((req.method === 'GET' || req.method === 'POST') && path === '/check') {
@@ -351,11 +264,11 @@ const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv
 if (isMain) {
   server.listen(PORT, () => {
     console.log(`FB Lookup Service running on port ${PORT}`);
-    console.log(`  ${PROXIES.length} owlproxy + ${FALLBACK_PROXIES.length} webshare proxies loaded`);
+    console.log(`  direct connection (no proxies), ${RETRIES} retries, ${TIMEOUT_MS}ms timeout`);
     console.log(`  GET  /check?phone=+8801869365360`);
     console.log(`  POST /check { "phone": "+8801869365360" }`);
     console.log(`  GET  /health`);
   });
 }
 
-export { acquireSession, buildBody, graphqlHeaders, checkNumber, proxyTunnel, proxiedPost, GRAPHQL_HEADERS, DOC_ID, BASE, PROXIES, FALLBACK_PROXIES };
+export { acquireSession, buildBody, graphqlHeaders, checkNumber, GRAPHQL_HEADERS, DOC_ID, BASE };
